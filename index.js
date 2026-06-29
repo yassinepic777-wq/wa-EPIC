@@ -54,23 +54,11 @@ client.on('ready', () => {
 });
 
 client.on('message', async (msg) => {
-    let mediaData = null;
-
-    // لو الرسالة فيها ميديا، حملها فوراً
-    if (msg.hasMedia) {
-        try {
-            mediaData = await msg.downloadMedia();
-        } catch (err) {
-            console.error("❌ Failed to download media:", err.message);
-        }
-    }
+    if (msg.hasMedia) return;
 
     const contact = await msg.getContact();
-    
-    // حفظ الرسالة (سواء نص أو ميديا) في الذاكرة
     messageLog.set(msg.id.id, {
-        body: msg.body || (mediaData ? '[مرفق ميديا بدون نص]' : ''),
-        media: mediaData,
+        body: msg.body,
         sender: contact.pushname || contact.name || "Unknown",
         time: new Date().toLocaleTimeString()
     });
@@ -83,45 +71,19 @@ client.on('message', async (msg) => {
 });
 
 client.on('message_revoke_everyone', async (after, before) => {
-    // استخدام after.id.id لضمان الوصول للـ ID الصحيح للرسالة المحذوفة
-    const deletedMsgId = after.id.id;
-
-    if (messageLog.has(deletedMsgId)) {
-        const originalMsg = messageLog.get(deletedMsgId);
-        const captionText = `🚨 *Deleted Message Detected!*\n👤 *Sender:* ${originalMsg.sender}\n📩 *Text:* ${originalMsg.body}\n🕒 *Time:* ${originalMsg.time}`;
+    if (before && messageLog.has(before.id.id)) {
+        const originalMsg = messageLog.get(before.id.id);
+        const text = `🚨 *Deleted Message Detected!*\n👤 *Sender:* ${originalMsg.sender}\n📩 *Message:* ${originalMsg.body}\n🕒 *Time:* ${originalMsg.time}`;
 
         try {
-            if (originalMsg.media) {
-                // إذا كانت الرسالة المحذوفة تحتوي على ميديا
-                const buffer = Buffer.from(originalMsg.media.data, 'base64');
-                const form = new FormData();
-                form.append('chat_id', TG_CHAT_ID);
-                form.append('caption', captionText);
-                form.append('parse_mode', 'Markdown');
-                
-                // تحديد اسم وامتداد الملف
-                const ext = originalMsg.media.mimetype.split('/')[1].split(';')[0];
-                const filename = originalMsg.media.filename || `deleted_media.${ext}`;
-                
-                form.append('document', buffer, { filename: filename });
-
-                await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, form, { headers: form.getHeaders() });
-                console.log('📤 Deleted Media forwarded to Telegram.');
-            } else {
-                // إذا كانت الرسالة نصية فقط
-                await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-                    chat_id: TG_CHAT_ID,
-                    text: captionText,
-                    parse_mode: 'Markdown'
-                });
-                console.log('📤 Deleted Text forwarded to Telegram.');
-            }
+            await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+                chat_id: TG_CHAT_ID,
+                text: text,
+                parse_mode: 'Markdown'
+            });
         } catch (e) {
             console.error("Telegram API Error:", e.message);
         }
-
-        // مسح الرسالة من الذاكرة بعد إرسالها لتفريغ المساحة
-        messageLog.delete(deletedMsgId);
     }
 });
 
