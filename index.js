@@ -1,29 +1,24 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 const axios = require('axios');
+const fs = require('fs');
 const FormData = require('form-data');
-const express = require('express');
+require('dotenv').config();
 
-// ================= إعدادات الحسابات (عدلها هنا) =================
-const TELEGRAM_TOKEN = 'ضع_توكن_البوت_هنا';
-const TELEGRAM_CHAT_ID = 'ضع_أيدي_حسابك_هنا';
-// ==========================================================
+// قراءة الإعدادات من متغيرات السيرفر
+const TG_TOKEN = process.env.TG_TOKEN;
+const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
-const app = express();
-const messageCache = new Map();
+// حماية: إذا لم توجد المتغيرات، لا يبدأ البوت
+if (!TG_TOKEN || !TG_CHAT_ID) {
+    console.error("❌ ERROR: Missing TG_TOKEN or TG_CHAT_ID in Environment Variables!");
+    process.exit(1);
+}
 
-// خادم الويب للحفاظ على تشغيل السيرفر 24/7
-app.get('/', (req, res) => {
-    res.send('البوت يعمل بنجاح وبانتظار الرسائل المحذوفة!');
-});
+const messageLog = new Map();
 
-app.listen(3000, () => {
-    console.log('🌐 خادم الحفاظ على التشغيل جاهز على المنفذ 3000');
-});
-
-// إعداد متصفح الوهمي متوافق مع بيئة Replit
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }), // حفظ الجلسة في ملف
     puppeteer: {
         headless: true,
         args: [
@@ -33,111 +28,103 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
-            '--single-process',
             '--disable-gpu'
         ]
     }
 });
 
-// عند توليد كود الـ QR، يتم تحويله لصورة وإرساله لتيليجرام
 client.on('qr', async (qr) => {
-    console.log('🔄 تم توليد كود QR جديد، جاري إرساله إلى تيليجرام...');
     try {
-        const qrBuffer = await QRCode.toBuffer(qr, { scale: 8 });
-        const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`;
-        
+        const imagePath = './whatsapp-qr.png';
+        await QRCode.toFile(imagePath, qr, { width: 300 });
         const form = new FormData();
-        form.append('chat_id', TELEGRAM_CHAT_ID);
-        form.append('caption', '📱 امسح هذا الكود خلال 20 ثانية لربط حساب واتساب بالبوت!');
-        form.append('photo', qrBuffer, { filename: 'whatsapp-qr.png' });
+        form.append('chat_id', TG_CHAT_ID);
+        form.append('photo', fs.createReadStream(imagePath));
+        form.append('caption', '📸 *WhatsApp Radar system requested login!*');
 
-        await axios.post(url, form, { headers: form.getHeaders() });
-        console.log('✅ تم إرسال الكود لتيليجرام بنجاح.');
+        await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, form, { headers: form.getHeaders() });
+        console.log('🚀 QR sent to Telegram.');
     } catch (err) {
-        console.error('❌ فشل في إرسال كود QR لتيليجرام:', err.message);
+        console.error('QR Error:', err.message);
     }
 });
 
 client.on('ready', () => {
-    console.log('🚀 تم الاتصال بنجاح! البوت الآن يراقب الرسائل المحذوفة.');
-    sendTextToTelegram('🚀 تم تشغيل البوت بنجاح وهو الآن يراقب الرسايل المحذوفة في الخلفية!');
+    console.log('🛡️ WhatsApp Radar is active!');
 });
 
-// التقاط الرسايل وتخزينها مؤقتاً
-client.on('message', async msg => {
+client.on('message', async (msg) => {
     let mediaData = null;
+
+    // لو الرسالة فيها ميديا، حملها فوراً
     if (msg.hasMedia) {
         try {
             mediaData = await msg.downloadMedia();
         } catch (err) {
-            console.error("❌ خطأ في تحميل الميديا الفوري:", err.message);
+            console.error("❌ Failed to download media:", err.message);
         }
     }
+
+    const contact = await msg.getContact();
     
-    messageCache.set(msg.id.id, {
-        text: msg.body || '',
+    // حفظ الرسالة (سواء نص أو ميديا) في الذاكرة
+    messageLog.set(msg.id.id, {
+        body: msg.body || (mediaData ? '[مرفق ميديا بدون نص]' : ''),
         media: mediaData,
-        sender: msg.from,
-        timestamp: Date.now()
+        sender: contact.pushname || contact.name || "Unknown",
+        time: new Date().toLocaleTimeString()
     });
+
+    // تقليل حجم الذاكرة (إبقاء آخر 200 رسالة فقط)
+    if (messageLog.size > 200) {
+        const firstKey = messageLog.keys().next().value;
+        messageLog.delete(firstKey);
+    }
 });
 
-// لقط حدث الحذف من الجميع
 client.on('message_revoke_everyone', async (after, before) => {
+    // استخدام after.id.id لضمان الوصول للـ ID الصحيح للرسالة المحذوفة
     const deletedMsgId = after.id.id;
-    
-    if (messageCache.has(deletedMsgId)) {
-        const cachedMsg = messageCache.get(deletedMsgId);
-        const fromInfo = after.author ? `${after.author} (في جروب)` : after.from;
-        const caption = `⚠️ *رسالة ممسوحة!*\n👤 من: ${fromInfo}\n📝 النص الأصلي: ${cachedMsg.text}`;
 
-        if (cachedMsg.media) {
-            await sendMediaToTelegram(cachedMsg.media, caption);
-        } else {
-            await sendTextToTelegram(caption);
+    if (messageLog.has(deletedMsgId)) {
+        const originalMsg = messageLog.get(deletedMsgId);
+        const captionText = `🚨 *Deleted Message Detected!*\n👤 *Sender:* ${originalMsg.sender}\n📩 *Text:* ${originalMsg.body}\n🕒 *Time:* ${originalMsg.time}`;
+
+        try {
+            if (originalMsg.media) {
+                // إذا كانت الرسالة المحذوفة تحتوي على ميديا
+                const buffer = Buffer.from(originalMsg.media.data, 'base64');
+                const form = new FormData();
+                form.append('chat_id', TG_CHAT_ID);
+                form.append('caption', captionText);
+                form.append('parse_mode', 'Markdown');
+                
+                // تحديد اسم وامتداد الملف
+                const ext = originalMsg.media.mimetype.split('/')[1].split(';')[0];
+                const filename = originalMsg.media.filename || `deleted_media.${ext}`;
+                
+                form.append('document', buffer, { filename: filename });
+
+                await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, form, { headers: form.getHeaders() });
+                console.log('📤 Deleted Media forwarded to Telegram.');
+            } else {
+                // إذا كانت الرسالة نصية فقط
+                await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+                    chat_id: TG_CHAT_ID,
+                    text: captionText,
+                    parse_mode: 'Markdown'
+                });
+                console.log('📤 Deleted Text forwarded to Telegram.');
+            }
+        } catch (e) {
+            console.error("Telegram API Error:", e.message);
         }
-        messageCache.delete(deletedMsgId);
+
+        // مسح الرسالة من الذاكرة بعد إرسالها لتفريغ المساحة
+        messageLog.delete(deletedMsgId);
     }
 });
 
-// دالة إرسال النصوص لتيليجرام
-async function sendTextToTelegram(text) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-    try {
-        await axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('❌ خطأ إرسال نص لتيليجرام:', error.message);
-    }
-}
-
-// دالة إرسال الميديا لتيليجرام
-async function sendMediaToTelegram(media, caption) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`;
-    try {
-        const buffer = Buffer.from(media.data, 'base64');
-        const form = new FormData();
-        form.append('chat_id', TELEGRAM_CHAT_ID);
-        form.append('caption', caption);
-        
-        const ext = media.mimetype.split('/')[1].split(';')[0]; 
-        const filename = media.filename || `deleted_file.${ext}`;
-        form.append('document', buffer, { filename: filename });
-
-        await axios.post(url, form, { headers: form.getHeaders() });
-    } catch (error) {
-        console.error('❌ خطأ إرسال ميديا لتيليجرام:', error.message);
-    }
-}
+process.on('unhandledRejection', (reason) => console.error('⚠️ Unhandled Rejection:', reason));
 
 client.initialize();
-
-// تنظيف الذاكرة المؤقتة كل نصف ساعة منعاً لامتلاء الرام
-setInterval(() => {
-    const ONE_HOUR = 60 * 60 * 1000;
-    const now = Date.now();
-    for (let [id, msg] of messageCache.entries()) {
-        if (now - msg.timestamp > ONE_HOUR) {
-            messageCache.delete(id);
-        }
-    }
-}, 30 * 60 * 1000);
